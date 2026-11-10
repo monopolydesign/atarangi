@@ -109,7 +109,7 @@ section:last-child { border-bottom: 0; }
 .when { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .when .date { font: 600 19px/1.1 var(--f-display); }
 .when .tz { font: 500 12px var(--f-mono); color: var(--ink-2); }
-.slider { display: grid; grid-template-columns: 52px 1fr 54px; align-items: center; gap: 8px; }
+.slider { display: grid; grid-template-columns: 52px 1fr 62px; align-items: center; gap: 8px; }
 .slider span { font-size: 12px; color: var(--ink-2); }
 .slider output { font: 500 12.5px var(--f-mono); text-align: right; font-variant-numeric: tabular-nums; }
 input[type=range] { width: 100%; accent-color: var(--sun); margin: 0; height: 24px; }
@@ -244,7 +244,7 @@ details[open] summary { margin-bottom: 8px; }
   .btn, .chip, .seg button { min-height: 38px; }
   .iconbtn { min-height: 34px; }
   input[type=range] { height: 32px; }
-  .slider { grid-template-columns: 48px 1fr 50px; }
+  .slider { grid-template-columns: 48px 1fr 60px; }
 }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
 </style>
@@ -286,14 +286,14 @@ details[open] summary { margin-bottom: 8px; }
         <input type="date" id="d-date" min="1950-01-01" max="2100-12-31" required>
         <button class="btn step" id="d-next" type="button" aria-label="Next day">›</button>
       </div>
-      <div class="slider"><span>Time</span><input type="range" id="t-time" min="0" max="1435" step="5" aria-label="Time of day"><output id="o-time">–</output></div>
+      <div class="slider"><span>Time</span><input type="range" id="t-time" min="0" max="1439" step="1" aria-label="Time of day"><output id="o-time">–</output></div>
       <div class="row">
         <button class="btn primary" id="btn-play" aria-pressed="false">Play day</button>
         <button class="btn" id="btn-now">Now</button>
         <button class="btn" id="btn-sol-w">21 Jun</button>
         <button class="btn" id="btn-sol-s">21 Dec</button>
-        <span class="speed" id="speed-label">10 min/s</span>
       </div>
+      <div class="slider"><span>Speed</span><input type="range" id="t-speed" min="0" max="8" step="1" value="3" aria-label="Play speed, simulated minutes per second"><output id="o-speed">10 min/s</output></div>
       <dl class="sunstats" aria-label="Sun at view centre">
         <div><dt>Sun altitude</dt><dd id="s-alt">–</dd></div>
         <div><dt>Azimuth</dt><dd id="s-az">–</dd></div>
@@ -996,14 +996,37 @@ $("btn-now").onclick = () => { Object.assign(state, nzNow()); applyTime(); };
 $("btn-sol-w").onclick = () => { state.mo = 6; state.d = 21; applyTime(); };
 $("btn-sol-s").onclick = () => { state.mo = 12; state.d = 21; applyTime(); };
 
-let playTimer = null;
+/* Play speed in simulated minutes per real second. Slow speeds step one minute at a time;
+   fast speeds update ten times a second with bigger steps, so shadows never redraw faster than needed. */
+const SPEEDS = [1, 2, 5, 10, 15, 30, 60, 120, 240];
+const speedLabel = (m) => (m < 60 ? `${m} min/s` : `${m / 60} h/s`);
+let playTimer = null, playSpeed = 10, playLast = 0, playAcc = 0;
+// Advance by real elapsed time, so simulated time stays right even when a slow device drops frames.
+function playTick() {
+  if (!state.playing) return;
+  const now = performance.now(), dt = Math.min(2000, now - playLast); playLast = now;
+  playAcc += playSpeed * dt / 1000;
+  const whole = Math.floor(playAcc);
+  if (whole >= 1) { playAcc -= whole; state.mins = (state.mins + whole) % 1440; applyTime(); }
+  playTimer = setTimeout(playTick, Math.max(16, Math.min(1000, 1000 / playSpeed, 100)));
+}
+function startPlay() {
+  clearTimeout(playTimer);
+  if (!state.playing) return;
+  playLast = performance.now(); playAcc = 0;
+  playTimer = setTimeout(playTick, 16);
+}
 $("btn-play").onclick = (e) => {
   state.playing = !state.playing;
   e.currentTarget.setAttribute("aria-pressed", state.playing);
   e.currentTarget.textContent = state.playing ? "Pause" : "Play day";
-  clearInterval(playTimer);
-  if (state.playing) playTimer = setInterval(() => { state.mins = (state.mins + 5) % 1440; applyTime(); }, 500);
+  startPlay();
 };
+$("t-speed").addEventListener("input", (e) => {
+  playSpeed = SPEEDS[+e.target.value];
+  $("o-speed").textContent = speedLabel(playSpeed);
+  startPlay();
+});
 
 /* ---------------- Camera wiring ---------------- */
 const camFields = ["c-lat", "c-lon", "c-h", "c-hd", "c-p"].map($);

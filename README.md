@@ -17,7 +17,7 @@ Data © Toitū Te Whenua LINZ, CC BY 4.0. Search data © OpenStreetMap contribut
 `arcgis/index.html` is the same app rebuilt on the ArcGIS Maps SDK for JavaScript 5.1, loaded from Esri's CDN.
 
 - LINZ aerial / Topo50 / hillshade basemaps as web tile layers; LINZ DEM/DSM terrain-rgb as a custom elevation layer
-- ArcGIS sun lighting with cast shadows for the chosen NZ date and time
+- ArcGIS sun lighting, plus a custom render pass for cast shadows: a height grid of LINZ terrain and building tops is traced towards the sun for every pixel, so terrain and buildings cast dark shadows like the Cesium build (Range and Darkness sliders included)
 - 3D buildings from Esri's Esri3D_Buildings_v1 scene service, falling back to LINZ NZ Building Outlines with LiDAR (DSM − DEM) heights if it can't load; an optional ArcGIS API key can be entered in the panel
 - Haze uses ArcGIS foggy weather; the shadow probe, search, compass and layout are shared with the Cesium build
 

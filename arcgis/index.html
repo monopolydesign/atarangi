@@ -356,8 +356,10 @@ details[open] summary { margin-bottom: 8px; }
         <button data-v="elevation-dsm" aria-pressed="false">DSM · surface</button>
       </div>
       <p class="hint">DSM adds buildings and trees where LiDAR exists and falls back to the DEM elsewhere.</p>
+      <div class="slider"><span>Range</span><input type="range" id="t-range" min="2" max="80" step="1" value="25" aria-label="Shadow render distance"><output id="o-range">25 km</output></div>
+      <div class="slider"><span>Darkness</span><input type="range" id="t-dark" min="0" max="80" step="5" value="35" aria-label="Shadow darkness"><output id="o-dark">0.35</output></div>
       <div class="slider"><span>Relief</span><input type="range" id="t-exag" min="1" max="3" step="0.25" value="1" aria-label="Vertical exaggeration"><output id="o-exag">1×</output></div>
-      <p class="hint">Shadows come from ArcGIS sun lighting for the chosen date and time.</p>
+      <p class="hint">Range sets how far terrain shadows reach. Buildings and terrain within about 2 km of the view centre get fine detail; beyond that, terrain is traced more coarsely.</p>
     </section>
 
     <section aria-label="Atmosphere">
@@ -719,14 +721,15 @@ async function loadArcGIS(mods) {
   if (window.__ARCGIS_BUNDLE) { const m = (await import(window.__ARCGIS_BUNDLE)).default; return mods.map((k) => m[k]); } // local test build
   return Promise.all(mods.map((m) => import(m).then((x) => x.default ?? x)));
 }
-let EsriMap, SceneView, Basemap, Ground, WebTileLayer, BaseElevationLayer, TileInfo, FeatureLayer, GraphicsLayer, Graphic, Point, Polyline, reactiveUtils, esriConfig, Camera, SceneLayer;
+let EsriMap, SceneView, Basemap, Ground, WebTileLayer, BaseElevationLayer, TileInfo, FeatureLayer, GraphicsLayer, Graphic, Point, Polyline, reactiveUtils, esriConfig, Camera, SceneLayer, RenderNode, webglUtils, SpatialReference;
 try {
-  [EsriMap, SceneView, Basemap, Ground, WebTileLayer, BaseElevationLayer, TileInfo, FeatureLayer, GraphicsLayer, Graphic, Point, Polyline, reactiveUtils, esriConfig, Camera, SceneLayer] = await loadArcGIS([
+  [EsriMap, SceneView, Basemap, Ground, WebTileLayer, BaseElevationLayer, TileInfo, FeatureLayer, GraphicsLayer, Graphic, Point, Polyline, reactiveUtils, esriConfig, Camera, SceneLayer, RenderNode, webglUtils, SpatialReference] = await loadArcGIS([
     "@arcgis/core/Map.js", "@arcgis/core/views/SceneView.js", "@arcgis/core/Basemap.js", "@arcgis/core/Ground.js",
     "@arcgis/core/layers/WebTileLayer.js", "@arcgis/core/layers/BaseElevationLayer.js", "@arcgis/core/layers/support/TileInfo.js",
     "@arcgis/core/layers/FeatureLayer.js", "@arcgis/core/layers/GraphicsLayer.js", "@arcgis/core/Graphic.js",
     "@arcgis/core/geometry/Point.js", "@arcgis/core/geometry/Polyline.js", "@arcgis/core/core/reactiveUtils.js", "@arcgis/core/config.js",
-    "@arcgis/core/Camera.js", "@arcgis/core/layers/SceneLayer.js",
+    "@arcgis/core/Camera.js", "@arcgis/core/layers/SceneLayer.js", "@arcgis/core/views/3d/webgl/RenderNode.js", "@arcgis/core/views/3d/webgl.js",
+    "@arcgis/core/geometry/SpatialReference.js",
   ]);
 } catch (e) {
   console.error(e);
@@ -770,7 +773,12 @@ const LinzElevationLayer = BaseElevationLayer.createSubclass({
   load() {
     this.tileInfo = TileInfo.create({ size: 256, numLODs: MAX_DEM_Z + 1, spatialReference: { wkid: 3857 } });
   },
-  fetchTile(level, row, col) { return linzElevationTile(this.src, level, row, col, this.factor); },
+  fetchTile(level, row, col, options) {
+    return linzElevationTile(this.src, level, row, col, this.factor).then((v) => {
+      if (options && options.signal && options.signal.aborted) throw new DOMException("Aborted", "AbortError");
+      return v;
+    });
+  },
 });
 function baseLayerFor(set) {
   return new WebTileLayer({
@@ -806,7 +814,7 @@ const view = new SceneView({
   container: "map", map, viewingMode: "global", qualityProfile: QUALITY[quality.level].profile,
   camera: new Camera({ position: new Point({ longitude: start.lon, latitude: start.lat, z: start.h }), heading: start.hd, tilt: 90 + start.p }),
   environment: {
-    lighting: { type: "sun", date: new Date(), directShadowsEnabled: true, displayUTCOffset: 13 },
+    lighting: { type: "sun", date: new Date(), directShadowsEnabled: false, displayUTCOffset: 13 }, // cast shadows come from the custom pass below
     atmosphereEnabled: true, starsEnabled: true,
   },
   popupEnabled: false,
@@ -1764,6 +1772,271 @@ $("search-form").addEventListener("submit", (e) => {
 qEl.addEventListener("focus", () => { if (results.length) renderList(); });
 document.addEventListener("pointerdown", (e) => { if (!$("search-form").contains(e.target)) setExpanded(false); });
 $("probe-clear").addEventListener("click", () => { showGraphic(placeEnt, false); });
+
+/* ---------------- Cast shadows: custom render pass ----------------
+   ArcGIS's built-in shadows are pale and terrain never casts them, so this pass reproduces the Cesium build:
+   a height grid of LINZ terrain plus building tops is built around the view centre (a fine grid within about
+   2 km and a coarse one out to the shadow Range), and every pixel's path towards the sun is traced through it
+   on the GPU. Pixels with terrain or a building in the way are darkened by the Darkness setting. */
+const SHQ = { high: { N: 1024, steps: 220 }, balanced: { N: 1024, steps: 160 }, battery: { N: 512, steps: 100 } }[quality.level];
+const shadow = { on: true, dark: 0.35, rangeKm: 25, seq: 0, ver: 0, timer: null, grid: null, uploadedVer: -1 };
+const R_EARTH = 6371000;
+
+function scheduleShadowGrid(force) {
+  clearTimeout(shadow.timer);
+  shadow.timer = setTimeout(() => buildShadowGrid(force).catch((e) => console.warn("Shadow grid failed", e)), force ? 50 : 300);
+}
+
+async function buildShadowGrid(force) {
+  const { lat: lat0, lon: lon0, ground } = viewCentre();
+  if (!(lon0 >= 166 && lon0 <= 179 && lat0 >= -47.8 && lat0 <= -34)) { shadow.grid = null; shadowNode.requestRender(); return; }
+  const agl = Math.max(50, view.camera.position.z - (ground ?? haze.ground ?? 0));
+  const N = SHQ.N;
+  const nearSize = Math.min(4000, Math.max(1500, agl * 4));
+  const farSize = Math.max(nearSize * 2, shadow.rangeKm * 2000);
+  const key = `${state.terrain}|${bld.on}|${state.exag}|${shadow.rangeKm}`;
+  const g = shadow.grid;
+  if (!force && g && g.key === key) {
+    const dx = (lon0 - g.lon0) * 111320 * Math.cos(lat0 * DEG), dy = (lat0 - g.lat0) * 111320;
+    const ratio = nearSize / g.nearSize;
+    if (Math.hypot(dx, dy) < g.nearSize * 0.2 && ratio < 1.6 && ratio > 0.6) return; // current grid still fits the view
+  }
+  const seq = ++shadow.seq;
+  const src = state.terrain, exag = state.exag;
+  const nearCell = nearSize / N, farCell = farSize / N;
+  const zFor = (cell) => Math.round(Math.log2(156543 * Math.cos(lat0 * DEG) / cell));
+  const zNear = Math.max(12, Math.min(16, zFor(nearCell))), zFar = Math.max(8, Math.min(15, Math.round(Math.log2(156543 * Math.cos(lat0 * DEG) / farCell))));
+  const mLo = 111320 * Math.cos(lat0 * DEG);
+  const box = (size) => [lon0 - size / 2 / mLo, lat0 - size / 2 / 111320, lon0 + size / 2 / mLo, lat0 + size / 2 / 111320];
+  const store = new Map();
+  await Promise.all([preload(src, ...box(nearSize), zNear, store), preload(src, ...box(farSize), zFar, store)]);
+  if (seq !== shadow.seq) return;
+  let maxH = -1e9;
+  const fill = async (size, z) => {
+    const cell = size / N, a = new Float32Array(N * N);
+    for (let j = 0; j < N; j++) {
+      const y = (j + 0.5) * cell - size / 2, lat = lat0 + y / 111320, row = j * N;
+      for (let i = 0; i < N; i++) {
+        const x = (i + 0.5) * cell - size / 2;
+        const h = sampleSync(src, lon0 + x / mLo, lat, z, store) * exag - (x * x + y * y) / (2 * R_EARTH); // local frame: Earth curves away
+        a[row + i] = h; if (h > maxH) maxH = h;
+      }
+      if ((j & 63) === 63) { await new Promise((r) => setTimeout(r, 0)); if (seq !== shadow.seq) return null; }
+    }
+    return a;
+  };
+  const near = await fill(nearSize, zNear); if (!near) return;
+  const far = await fill(farSize, zFar); if (!far) return;
+  // East-north-up frame at the grid centre (height 0), expressed in render coordinates.
+  const M = webglUtils.renderCoordinateTransformAt(view, [lon0, lat0, 0], SpatialReference.WGS84, new Array(16));
+  if (!M) return;
+  // Show terrain shadows straight away; building tops are added once their tiles are in.
+  const grid = { seq, ver: ++shadow.ver, lon0, lat0, near, far, nearSize, farSize, N, maxH, M, key };
+  shadow.grid = grid; shadowNode.requestRender();
+  // Building tops (LINZ outlines with LiDAR heights) go into the fine grid, whichever building source is displayed.
+  if (bld.on && exag === 1) {
+    let list = [];
+    try { list = await buildingsNear(lat0, lon0, nearSize * 0.72); } catch (e) {}
+    if (seq !== shadow.seq) return;
+    for (const b of list) {
+      let w = Infinity, e = -Infinity, s = Infinity, n = -Infinity;
+      for (const [lo, la] of b.rings[0]) { const x = (lo - lon0) * mLo, y = (la - lat0) * 111320; if (x < w) w = x; if (x > e) e = x; if (y < s) s = y; if (y > n) n = y; }
+      const i0 = Math.max(0, Math.floor((w + nearSize / 2) / nearCell)), i1 = Math.min(N - 1, Math.floor((e + nearSize / 2) / nearCell));
+      const j0 = Math.max(0, Math.floor((s + nearSize / 2) / nearCell)), j1 = Math.min(N - 1, Math.floor((n + nearSize / 2) / nearCell));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+        const x = (i + 0.5) * nearCell - nearSize / 2, y = (j + 0.5) * nearCell - nearSize / 2;
+        if (!inPoly(b.rings, lon0 + x / mLo, lat0 + y / 111320)) continue;
+        const h = b.top - (x * x + y * y) / (2 * R_EARTH);
+        if (h > near[j * N + i]) { near[j * N + i] = h; if (h > maxH) maxH = h; }
+      }
+    }
+  }
+  if (seq !== shadow.seq) return;
+  grid.maxH = maxH; grid.ver = ++shadow.ver;
+  shadowNode.requestRender();
+}
+
+function invert4(m) {
+  const a = m, o = new Array(16);
+  const a00 = a[0], a01 = a[1], a02 = a[2], a03 = a[3], a10 = a[4], a11 = a[5], a12 = a[6], a13 = a[7];
+  const a20 = a[8], a21 = a[9], a22 = a[10], a23 = a[11], a30 = a[12], a31 = a[13], a32 = a[14], a33 = a[15];
+  const b00 = a00 * a11 - a01 * a10, b01 = a00 * a12 - a02 * a10, b02 = a00 * a13 - a03 * a10, b03 = a01 * a12 - a02 * a11;
+  const b04 = a01 * a13 - a03 * a11, b05 = a02 * a13 - a03 * a12, b06 = a20 * a31 - a21 * a30, b07 = a20 * a32 - a22 * a30;
+  const b08 = a20 * a33 - a23 * a30, b09 = a21 * a32 - a22 * a31, b10 = a21 * a33 - a23 * a31, b11 = a22 * a33 - a23 * a32;
+  const det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+  if (!det) return null;
+  const d = 1 / det;
+  o[0] = (a11 * b11 - a12 * b10 + a13 * b09) * d; o[1] = (a02 * b10 - a01 * b11 - a03 * b09) * d;
+  o[2] = (a31 * b05 - a32 * b04 + a33 * b03) * d; o[3] = (a22 * b04 - a21 * b05 - a23 * b03) * d;
+  o[4] = (a12 * b08 - a10 * b11 - a13 * b07) * d; o[5] = (a00 * b11 - a02 * b08 + a03 * b07) * d;
+  o[6] = (a32 * b02 - a30 * b05 - a33 * b01) * d; o[7] = (a20 * b05 - a22 * b02 + a23 * b01) * d;
+  o[8] = (a10 * b10 - a11 * b08 + a13 * b06) * d; o[9] = (a01 * b08 - a00 * b10 - a03 * b06) * d;
+  o[10] = (a30 * b04 - a31 * b02 + a33 * b00) * d; o[11] = (a21 * b02 - a20 * b04 - a23 * b00) * d;
+  o[12] = (a11 * b07 - a10 * b09 - a12 * b06) * d; o[13] = (a00 * b09 - a01 * b07 + a02 * b06) * d;
+  o[14] = (a31 * b01 - a30 * b03 - a32 * b00) * d; o[15] = (a20 * b03 - a21 * b01 + a22 * b00) * d;
+  return o;
+}
+
+const SHADOW_VS = `#version 300 es
+in vec2 aPos;
+out vec2 vUv;
+void main() { vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }`;
+const SHADOW_FS = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+uniform sampler2D uColor;
+uniform sampler2D uDepth;
+uniform sampler2D uNormal;
+uniform sampler2D uNear;
+uniform sampler2D uFar;
+uniform mat4 uInvProj;
+uniform mat3 uA;          // view-space vector -> local east/north/up
+uniform vec3 uEye;        // camera position in the local frame (m)
+uniform vec3 uSun;        // unit vector towards the sun, local frame
+uniform float uNearSize, uFarSize, uNearCell, uFarCell, uMaxH, uDark, uOn;
+uniform int uSteps;
+uniform int uDebug;
+in vec2 vUv;
+out vec4 fragColor;
+float hNear(vec2 xy) {
+  ivec2 s = textureSize(uNear, 0);
+  ivec2 p = clamp(ivec2((xy / uNearSize + 0.5) * vec2(s)), ivec2(0), s - 1);
+  return texelFetch(uNear, p, 0).r;
+}
+float hFar(vec2 xy) {
+  ivec2 s = textureSize(uFar, 0);
+  vec2 f = (xy / uFarSize + 0.5) * vec2(s) - 0.5;
+  ivec2 i = ivec2(floor(f)); vec2 t = fract(f); ivec2 m = s - 1;
+  float a = texelFetch(uFar, clamp(i, ivec2(0), m), 0).r, b = texelFetch(uFar, clamp(i + ivec2(1, 0), ivec2(0), m), 0).r;
+  float c = texelFetch(uFar, clamp(i + ivec2(0, 1), ivec2(0), m), 0).r, d = texelFetch(uFar, clamp(i + ivec2(1, 1), ivec2(0), m), 0).r;
+  return mix(mix(a, b, t.x), mix(c, d, t.x), t.y);
+}
+void main() {
+  vec4 col = texture(uColor, vUv);
+  float depth = texture(uDepth, vUv).r;
+  if (uOn < 0.5 || depth >= 1.0 || uSun.z <= 0.0) { fragColor = col; return; }
+  vec4 pv = uInvProj * vec4(vUv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+  pv /= pv.w;
+  vec3 p = uEye + uA * pv.xyz;
+  vec3 n = normalize(uA * (2.0 * texture(uNormal, vUv).xyz - 1.0));
+  if (uDebug == 1) { fragColor = vec4(fract(p.x / 1000.0), fract(p.y / 1000.0), clamp(p.z / 4000.0, 0.0, 1.0), 1.0); return; }
+  if (uDebug == 3) { fragColor = vec4(n * 0.5 + 0.5, 1.0); return; }
+  float ndl = dot(n, uSun);
+  // Surfaces turned away from the sun get no direct light at all, so they take the full shadow darkness
+  // (ArcGIS keeps them much brighter than Cesium does). The ramp keeps the terminator soft.
+  float facing = smoothstep(-0.03, 0.15, ndl);
+  if (facing <= 0.0) { fragColor = vec4(col.rgb * uDark, col.a); return; }
+  float halfN = uNearSize * 0.5, halfF = uFarSize * 0.5;
+  bool inNear = all(lessThan(abs(p.xy), vec2(halfN)));
+  if (!inNear && any(greaterThan(abs(p.xy), vec2(halfF)))) { fragColor = vec4(col.rgb * mix(uDark, 1.0, facing), col.a); return; }
+  float cell = inNear ? uNearCell : uFarCell;
+  vec3 o = p + n * (cell * 1.5) + vec3(0.0, 0.0, 0.3);    // lift off the surface to avoid self-shadowing
+  // Stagger each pixel's first step so the fixed step size doesn't show up as contour bands.
+  float jitter = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+  float vis = 1.0, t = cell * (0.6 + jitter);
+  for (int i = 0; i < 256; i++) {
+    if (i >= uSteps) break;
+    vec3 q = o + uSun * t;
+    if (q.z > uMaxH) break;                                 // above everything in the grid: lit
+    float h, c;
+    if (all(lessThan(abs(q.xy), vec2(halfN)))) { h = hNear(q.xy); c = uNearCell; }
+    else if (all(lessThan(abs(q.xy), vec2(halfF)))) { h = hFar(q.xy); c = uFarCell; }
+    else break;
+    vis = min(vis, clamp((q.z - h) / max(t * 0.004, 0.3), 0.0, 1.0)); // narrow penumbra, close to Cesium's hard shadow edge
+    if (vis <= 0.0) break;
+    t += max(c * 0.7, t * 0.04);
+  }
+  if (uDebug == 2) { fragColor = vec4(vec3(vis * facing), 1.0); return; }
+  float shade = mix(uDark, 1.0, vis * facing);
+  fragColor = vec4(col.rgb * shade, col.a);
+}`;
+
+const ShadowNode = RenderNode.createSubclass({
+  constructor() {
+    // After ArcGIS's atmosphere and aerial haze, so shadows aren't washed out (as in the Cesium build).
+    this.consumes = { required: ["composite-color", "normals"] };
+    this.produces = "composite-color";
+  },
+  _setup(gl) {
+    const sh = (type, src) => { const o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o);
+      if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o; };
+    const prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, SHADOW_VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, SHADOW_FS));
+    gl.bindAttribLocation(prog, 0, "aPos"); gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    const u = {};
+    for (const nme of ["uColor", "uDepth", "uNormal", "uNear", "uFar", "uInvProj", "uA", "uEye", "uSun", "uNearSize", "uFarSize", "uNearCell", "uFarCell", "uMaxH", "uDark", "uOn", "uSteps", "uDebug"]) u[nme] = gl.getUniformLocation(prog, nme);
+    const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+    const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.bindVertexArray(null);
+    const tex = () => { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+      for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 1, 1, 0, gl.RED, gl.FLOAT, new Float32Array([-1e6])); return t; };
+    this._gl = { prog, u, vao, near: tex(), far: tex() };
+  },
+  render(inputs) {
+    const gl = this.gl;
+    const input = inputs.find((i) => i.name === "composite-color"), normals = inputs.find((i) => i.name === "normals");
+    if (!this._gl) { try { this._setup(gl); } catch (e) { console.warn("Shadow shader failed", e); this._failed = true; } }
+    if (this._failed || !input || !normals) return input;
+    const G = this._gl, g = shadow.grid, cam = this.camera;
+    if (g && shadow.uploadedVer !== g.ver) {
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      gl.bindTexture(gl.TEXTURE_2D, G.near); gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, g.N, g.N, 0, gl.RED, gl.FLOAT, g.near);
+      gl.bindTexture(gl.TEXTURE_2D, G.far); gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, g.N, g.N, 0, gl.RED, gl.FLOAT, g.far);
+      shadow.uploadedVer = g.ver;
+    }
+    let on = shadow.on && g ? 1 : 0, sun = [0, 0, -1], A = [1, 0, 0, 0, 1, 0, 0, 0, 1], eye = [0, 0, 0];
+    const invP = invert4(cam.projectionMatrix);
+    if (on && invP) {
+      const sp = solar(currentDate(), g.lat0, g.lon0), el = sp.app * DEG, az = sp.az * DEG;
+      sun = [Math.sin(az) * Math.cos(el), Math.cos(az) * Math.cos(el), Math.sin(el)];
+      const M = g.M, V = cam.viewMatrix, E = cam.eye;
+      A = new Array(9);
+      for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) {
+        let v = 0; for (let k = 0; k < 3; k++) v += M[r * 4 + k] * V[k * 4 + c];
+        A[c * 3 + r] = v; // column-major mat3
+      }
+      for (let r = 0; r < 3; r++) { let v = 0; for (let k = 0; k < 3; k++) v += M[r * 4 + k] * (E[k] - M[12 + k]); eye[r] = v; }
+    } else on = 0;
+    const output = this.acquireOutputFramebuffer();
+    const vp = cam.viewport;
+    gl.viewport(vp[0], vp[1], vp[2], vp[3]);
+    gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE);
+    gl.useProgram(G.prog);
+    const bind = (unit, glTex, loc) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, glTex); gl.uniform1i(loc, unit); };
+    bind(0, input.getTexture().glName, G.u.uColor);
+    bind(1, input.getTexture(gl.DEPTH_STENCIL_ATTACHMENT).glName, G.u.uDepth);
+    bind(2, normals.getTexture().glName, G.u.uNormal);
+    bind(3, G.near, G.u.uNear);
+    bind(4, G.far, G.u.uFar);
+    gl.uniformMatrix4fv(G.u.uInvProj, false, invP || [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    gl.uniformMatrix3fv(G.u.uA, false, A);
+    gl.uniform3fv(G.u.uEye, eye); gl.uniform3fv(G.u.uSun, sun);
+    gl.uniform1f(G.u.uNearSize, g ? g.nearSize : 1); gl.uniform1f(G.u.uFarSize, g ? g.farSize : 1);
+    gl.uniform1f(G.u.uNearCell, g ? g.nearSize / g.N : 1); gl.uniform1f(G.u.uFarCell, g ? g.farSize / g.N : 1);
+    gl.uniform1f(G.u.uMaxH, g ? g.maxH + 1 : 0); gl.uniform1f(G.u.uDark, shadow.dark); gl.uniform1f(G.u.uOn, on);
+    gl.uniform1i(G.u.uSteps, SHQ.steps); gl.uniform1i(G.u.uDebug, shadow.debug | 0);
+    gl.bindVertexArray(G.vao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindVertexArray(null);
+    output.attachDepth(input.getAttachment(gl.DEPTH_STENCIL_ATTACHMENT));
+    this.resetWebGLState();
+    return output;
+  },
+});
+const shadowNode = new ShadowNode({ view });
+
+onStationary.push(() => scheduleShadowGrid(false));
+$("seg-terrain").addEventListener("click", () => scheduleShadowGrid(true));
+$("t-exag").addEventListener("input", () => scheduleShadowGrid(true));
+$("b-toggle").addEventListener("click", () => scheduleShadowGrid(true));
+$("t-range").addEventListener("input", (e) => { shadow.rangeKm = +e.target.value; $("o-range").textContent = `${shadow.rangeKm} km`; scheduleShadowGrid(true); });
+$("t-dark").addEventListener("input", (e) => { shadow.dark = +e.target.value / 100; $("o-dark").textContent = shadow.dark.toFixed(2); shadowNode.requestRender(); });
+view.when(() => scheduleShadowGrid(true));
+window.__shadow = { shadow, shadowNode, buildShadowGrid };
 
 /* ---------------- 3D compass ---------------- */
 const compassDisc = $("compass-disc"), compassSun = $("compass-sun"), compassRead = $("compass-read");

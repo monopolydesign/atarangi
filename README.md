@@ -11,3 +11,14 @@
 Everything runs in the browser. Open `index.html` directly or serve the folder with any static host.
 
 Data © Toitū Te Whenua LINZ, CC BY 4.0. Search data © OpenStreetMap contributors, ODbL.
+
+## ArcGIS Maps SDK version (`arcgis/`)
+
+`arcgis/index.html` is the same app rebuilt on the ArcGIS Maps SDK for JavaScript 5.1, loaded from Esri's CDN.
+
+- LINZ aerial / Topo50 / hillshade basemaps as web tile layers; LINZ DEM/DSM terrain-rgb as a custom elevation layer
+- ArcGIS sun lighting with cast shadows for the chosen NZ date and time
+- 3D buildings from Esri's Esri3D_Buildings_v1 scene service, falling back to LINZ NZ Building Outlines with LiDAR (DSM − DEM) heights if it can't load; an optional ArcGIS API key can be entered in the panel
+- Haze uses ArcGIS foggy weather; the shadow probe, search, compass and layout are shared with the Cesium build
+
+Serve it over http(s) (GitHub Pages or `python3 -m http.server`); opening it straight from disk is not supported.
